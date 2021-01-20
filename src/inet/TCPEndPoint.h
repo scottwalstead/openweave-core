@@ -38,6 +38,30 @@ namespace Inet {
 
 class InetLayer;
 
+#if INET_CONFIG_TCP_CONN_REPAIR_SUPPORTED
+typedef struct TCPConnRepairInfo
+{
+    IPAddress srcIP;
+    IPAddress dstIP;
+    IPAddressType addrType;
+    uint16_t srcPort;
+    uint16_t dstPort;
+    uint32_t txSeq;
+    uint32_t rxSeq;
+    uint32_t sndWl1;
+    uint32_t sndWnd;
+    uint32_t maxWindow;
+    uint32_t rcvWnd;
+    uint32_t rcvWup;
+    uint32_t tsVal;
+    uint32_t tsecr;
+    uint16_t mss;
+    uint8_t  sndWscale;
+    uint8_t  rcvWscale;
+    uint8_t  tcpOptions;
+} TCPConnRepairInfo;
+#endif // INET_CONFIG_TCP_CONN_REPAIR_SUPPORTED
+
 /**
  * @brief   Objects of this class represent TCP transport endpoints.
  *
@@ -396,6 +420,11 @@ public:
      * @return  Returns an opaque unique identifier for use logs.
      */
     uint16_t LogId(void);
+
+#if INET_CONFIG_TCP_CONN_REPAIR_SUPPORTED
+    INET_ERROR RepairConnection(TCPConnRepairInfo &connRepairInfo, InterfaceId intf);
+#endif // INET_CONFIG_TCP_CONN_REPAIR_SUPPORTED
+
 
     /**
      * @brief   Type of connection establishment event handling function.

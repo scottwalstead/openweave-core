@@ -241,6 +241,11 @@ class NL_DLL_EXPORT WeaveTunnelConnectionMgr
  */
     void StopAndReconnectTunnelConn(ReconnectParam & reconnParam);
 
+
+#if WEAVE_CONFIG_TCP_CONN_REPAIR_SUPPORTED
+    void SetConnectionRepairInfoCallback(nl::Weave::WeaveConnection::ConnectionRepairInfoGetterFunct aGetConnectionRepairInfo, void *repairCtxt);
+#endif // WEAVE_CONFIG_TCP_CONN_REPAIR_SUPPORTED
+
 /**
  * Get a pointer to the Weave Tunnel Connection object for this
  * Tunnel Connection Manager.

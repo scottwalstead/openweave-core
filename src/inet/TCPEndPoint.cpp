@@ -296,6 +296,229 @@ INET_ERROR TCPEndPoint::Listen(uint16_t backlog)
     return res;
 }
 
+#if INET_CONFIG_TCP_CONN_REPAIR_SUPPORTED
+INET_ERROR TCPEndPoint::RepairConnection(TCPConnRepairInfo &connRepairInfo, InterfaceId intf)
+{
+    INET_ERROR res = INET_NO_ERROR;
+
+#if WEAVE_SYSTEM_CONFIG_USE_LWIP
+    res = INET_ERROR_NOT_SUPPORTED;
+    ExitNow();
+#endif // WEAVE_SYSTEM_CONFIG_USE_LWIP
+
+#if WEAVE_SYSTEM_CONFIG_USE_SOCKETS
+    struct tcp_repair_opt opts[4];
+    char srcIPStr[64] = {0}, dstIPStr[64] = {0};
+    int onr = 0;
+    int val;
+
+/* restore session */
+    connRepairInfo.srcIP.ToString(srcIPStr, sizeof(srcIPStr));
+    connRepairInfo.dstIP.ToString(dstIPStr, sizeof(dstIPStr));
+
+    WeaveLogDetail(Inet, "TCP repair SRC: %s:%d seq %u\n", srcIPStr, connRepairInfo.srcPort, connRepairInfo.txSeq);
+    WeaveLogDetail(Inet, "TCP repair DST: %s:%d seq %u\n", dstIPStr, connRepairInfo.dstPort, connRepairInfo.rxSeq);
+
+    WeaveLogDetail(Inet, "TCP repair OPT: snd_wl1 %u snd_wnd %u max_window %u rcv_wnd %u rcv_wup %u\n",
+        connRepairInfo.sndWl1, connRepairInfo.sndWnd, connRepairInfo.maxWindow, connRepairInfo.rcvWnd, connRepairInfo.rcvWup);
+
+    WeaveLogDetail(Inet, "TCP repair OPT: mss %u snd_wscale %u rcv_wscale %u tcpi_opt %u\n",
+        connRepairInfo.mss, connRepairInfo.sndWscale, connRepairInfo.rcvWscale, connRepairInfo.tcpOptions);
+
+    WeaveLogDetail(Inet, "local_port(%u), server_port(%u), tx_seq(%u), rx_seq(%u), snd_wl1(%u), snd_wnd(%u), max_window(%u), rcv_wnd(%u), rcv_wup(%u)\n",
+        connRepairInfo.srcPort, connRepairInfo.dstPort, connRepairInfo.txSeq, connRepairInfo.rxSeq, connRepairInfo.sndWl1, connRepairInfo.sndWnd,
+        connRepairInfo.maxWindow, connRepairInfo.rcvWnd, connRepairInfo.rcvWup);
+
+    if (!connRepairInfo.srcPort || !connRepairInfo.dstPort || !connRepairInfo.txSeq ||
+        !connRepairInfo.rxSeq || !connRepairInfo.sndWl1 || !connRepairInfo.sndWnd ||
+        !connRepairInfo.maxWindow || !connRepairInfo.rcvWnd || !connRepairInfo.rcvWup)
+    {
+        WeaveLogError(Inet, "Not enough info to repair TCP connection\n");
+        ExitNow(res = INET_ERROR_BAD_ARGS);
+    }
+
+    res = GetSocket(connRepairInfo.addrType);
+    if (res != INET_NO_ERROR)
+        ExitNow();
+
+    val = 1;
+    if (setsockopt(mSocket, SOL_TCP, TCP_REPAIR, &val, sizeof(val)) != 0)
+    {
+        WeaveLogError(Inet, "TCP_REPAIR failed: %d", errno);
+        ExitNow(res = Weave::System::MapErrorPOSIX(errno));
+    }
+
+    val = 1;
+    if (setsockopt(mSocket, SOL_SOCKET, SO_REUSEADDR, &val, sizeof(val)) != 0)
+    {
+        WeaveLogError(Inet, "SO_REUSEADDR failed: %d", errno);
+        ExitNow(res = Weave::System::MapErrorPOSIX(errno));
+    }
+
+    /* ============= Restore TCP properties ==================*/
+    val = TCP_SEND_QUEUE;
+    if (setsockopt(mSocket, SOL_TCP, TCP_REPAIR_QUEUE, &val, sizeof(val)) != 0)
+    {
+        WeaveLogError(Inet, "Repairing TCP_SEND_QUEUE failed: %d", errno);
+        ExitNow(res = Weave::System::MapErrorPOSIX(errno));
+    }
+
+    val = connRepairInfo.txSeq;
+    WeaveLogDetail(Inet, "Restoring Tx seq: %d", val);
+    if (setsockopt(mSocket, SOL_TCP, TCP_QUEUE_SEQ, &val, sizeof(val)) != 0)
+    {
+        WeaveLogError(Inet, "Tx Seq failed: %d", errno);
+        ExitNow(res = Weave::System::MapErrorPOSIX(errno));
+    }
+
+    val = TCP_RECV_QUEUE;
+    if (setsockopt(mSocket, SOL_TCP, TCP_REPAIR_QUEUE, &val, sizeof(val)) != 0) {
+        WeaveLogError(Inet, "Repairing TCP_RECV_QUEUE failed: %d", errno);
+        ExitNow(res = Weave::System::MapErrorPOSIX(errno));
+    }
+
+    val = connRepairInfo.rxSeq;
+    WeaveLogDetail(Inet, "Restoring Rx seq: %d", val);
+    if (setsockopt(mSocket, SOL_TCP, TCP_QUEUE_SEQ, &val, sizeof(val)) != 0) {
+        WeaveLogError(Inet, "Rx Seq failed: %d", errno);
+        ExitNow(res = Weave::System::MapErrorPOSIX(errno));
+    }
+
+    if (connRepairInfo.addrType == kIPAddressType_IPv6)
+    {
+        struct sockaddr_in6 serverAddress, localAddress;
+        memset(&localAddress, 0, sizeof(localAddress));
+        localAddress.sin6_family = AF_INET6;
+        localAddress.sin6_addr = connRepairInfo.srcIP.ToIPv6();
+        localAddress.sin6_port = htons(connRepairInfo.srcPort);
+
+        memset(&serverAddress, 0, sizeof(serverAddress));
+        serverAddress.sin6_family = AF_INET6;
+        serverAddress.sin6_addr = connRepairInfo.dstIP.ToIPv6();
+        serverAddress.sin6_port = htons(connRepairInfo.dstPort);
+
+        if (bind(mSocket, (struct sockaddr *) &localAddress, sizeof(localAddress)) != 0)
+        {
+            WeaveLogError(Inet, "Bind src address failed: %d", errno);
+            ExitNow(res = Weave::System::MapErrorPOSIX(errno));
+        }
+
+        if (connect(mSocket, (struct sockaddr *) &serverAddress, sizeof(serverAddress)) != 0)
+        {
+            WeaveLogError(Inet, "Connect to dst address failed: %d", errno);
+            ExitNow(res = Weave::System::MapErrorPOSIX(errno));
+        }
+    }
+#if INET_CONFIG_ENABLE_IPV4
+    else if (connRepairInfo.addrType == kIPAddressType_IPv4)
+    {
+        struct sockaddr_in serverAddress, localAddress;
+        memset(&localAddress, 0, sizeof(localAddress));
+        localAddress.sin_family = AF_INET;
+        localAddress.sin_addr = connRepairInfo.srcIP.ToIPv4();
+        localAddress.sin_port = htons(connRepairInfo.srcPort);
+
+        memset(&serverAddress, 0, sizeof(serverAddress));
+        serverAddress.sin_family = AF_INET;
+        serverAddress.sin_addr = connRepairInfo.dstIP.ToIPv4();
+        serverAddress.sin_port = htons(connRepairInfo.dstPort);
+
+        if (bind(mSocket, (struct sockaddr *) &localAddress, sizeof(localAddress)) != 0)
+        {
+            WeaveLogError(Inet, "Bind src address failed: %d", errno);
+            ExitNow(res = Weave::System::MapErrorPOSIX(errno));
+        }
+
+        if (connect(mSocket, (struct sockaddr *) &serverAddress, sizeof(serverAddress)) != 0)
+        {
+            WeaveLogError(Inet, "Connect to dst address failed: %d", errno);
+            ExitNow(res = Weave::System::MapErrorPOSIX(errno));
+        }
+    }
+#endif // INET_CONFIG_ENABLE_IPV4
+    else
+    {
+        ExitNow(res = INET_ERROR_WRONG_ADDRESS_TYPE);
+    }
+
+    /* Repair tcp options */
+    if (connRepairInfo.tcpOptions & TCPI_OPT_SACK)
+    {
+        WeaveLogDetail(Inet, "Turning SACK on\n");
+        opts[onr].opt_code = TCPOPT_SACK_PERMITTED;
+        opts[onr].opt_val = 0;
+        onr++;
+    }
+
+    if (connRepairInfo.tcpOptions & TCPI_OPT_WSCALE)
+    {
+        WeaveLogDetail(Inet, "Set Send Window Scale to %u\n", connRepairInfo.sndWscale);
+        WeaveLogDetail(Inet, "Set Receive Window Scale to %u\n", connRepairInfo.rcvWscale);
+        opts[onr].opt_code = TCPOPT_WINDOW;
+        opts[onr].opt_val = connRepairInfo.sndWscale + (connRepairInfo.rcvWscale << 16);
+        onr++;
+    }
+
+    if (connRepairInfo.tcpOptions & TCPI_OPT_TIMESTAMPS)
+    {
+        WeaveLogDetail(Inet, "Turning timestamps on\n");
+        opts[onr].opt_code = TCPOPT_TIMESTAMP;
+        opts[onr].opt_val = 0;
+        onr++;
+    }
+
+    WeaveLogDetail(Inet, "Set MSS clamp to %u\n", connRepairInfo.mss);
+    opts[onr].opt_code = TCPOPT_MAXSEG;
+    opts[onr].opt_val = connRepairInfo.mss;
+    onr++;
+
+    if (setsockopt(mSocket, SOL_TCP, TCP_REPAIR_OPTIONS, opts, onr * sizeof(struct tcp_repair_opt)) < 0)
+    {
+        WeaveLogError(Inet, "%s: %d: Can't repair tcp options", __func__, __LINE__);
+        ExitNow(res = Weave::System::MapErrorPOSIX(errno));
+    }
+
+    if (connRepairInfo.tcpOptions & TCPI_OPT_TIMESTAMPS)
+    {
+        if (setsockopt(mSocket, SOL_TCP, TCP_TIMESTAMP, &connRepairInfo.tsVal, sizeof(connRepairInfo.tsVal)) < 0)
+        {
+            WeaveLogError(Inet, "%s: %d: Can't set timestamp", __func__, __LINE__);
+            ExitNow(res = Weave::System::MapErrorPOSIX(errno));
+        }
+    }
+
+    if (connRepairInfo.maxWindow)
+    {
+        /* restore window */
+        struct tcp_repair_window windowOpt = {
+            .snd_wl1 = connRepairInfo.sndWl1,
+            .snd_wnd = connRepairInfo.sndWnd,
+            .max_window = connRepairInfo.maxWindow,
+            .rcv_wnd = connRepairInfo.rcvWnd,
+            .rcv_wup = connRepairInfo.rcvWup,
+        };
+
+        if (setsockopt(mSocket, SOL_TCP, TCP_REPAIR_WINDOW, &windowOpt, sizeof(windowOpt)) != 0)
+        {
+            WeaveLogError(Inet, "%s: %d: Unable to set window parameters", __func__, __LINE__);
+            ExitNow(res = Weave::System::MapErrorPOSIX(errno));
+        }
+    }
+
+    val = 0;
+    if (setsockopt(mSocket, SOL_TCP, TCP_REPAIR, &val, sizeof(val)) != 0)
+    {
+        WeaveLogError(Inet, "%s: %d: TCP_REPAIR failed", __func__, __LINE__);
+        ExitNow(res = Weave::System::MapErrorPOSIX(errno));
+    }
+#endif // WEAVE_SYSTEM_CONFIG_USE_SOCKETS
+
+exit:
+
+    return res;
+}
+#endif // INET_CONFIG_TCP_CONN_REPAIR_SUPPORTED
+
 INET_ERROR TCPEndPoint::Connect(IPAddress addr, uint16_t port, InterfaceId intf)
 {
     INET_ERROR res = INET_NO_ERROR;

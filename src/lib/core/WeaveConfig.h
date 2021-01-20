@@ -2356,6 +2356,17 @@
 #endif // WEAVE_CONFIG_MAX_SOFTWARE_VERSION_LENGTH
 
 /**
+ * @def WEAVE_CONFIG_TCP_CONN_REPAIR_SUPPORTED
+ *
+ * @brief
+ *   TODO
+ *
+ */
+#ifndef WEAVE_CONFIG_TCP_CONN_REPAIR_SUPPORTED
+#define WEAVE_CONFIG_TCP_CONN_REPAIR_SUPPORTED            (INET_CONFIG_TCP_CONN_REPAIR_SUPPORTED)
+#endif // WEAVE_CONFIG_TCP_CONN_REPAIR_SUPPORTED
+
+/**
  * @def WEAVE_NON_PRODUCTION_MARKER
  *
  * @brief Defines the name of a mark symbol whose presence signals that the Weave code

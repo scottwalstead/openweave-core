@@ -31,6 +31,10 @@
 #include <Weave/Profiles/weave-tunneling/WeaveTunnelAgent.h>
 #include <Weave/Profiles/weave-tunneling/WeaveTunnelCommon.h>
 
+#if WEAVE_CONFIG_TCP_CONN_REPAIR_SUPPORTED
+#include <Weave/Core/WeaveMessageLayer.h>
+#endif // WEAVE_CONFIG_TCP_CONN_REPAIR_SUPPORTED
+
 #include <Weave/Support/CodeUtils.h>
 #include <Weave/Support/RandUtils.h>
 #include <Weave/Support/FibonacciUtils.h>
@@ -277,6 +281,14 @@ void WeaveTunnelConnectionMgr::SetCallbacksForPersistedTunnelConnection(Persiste
 }
 #endif // WEAVE_CONFIG_PERSIST_CONNECTED_SESSION
 
+#if WEAVE_CONFIG_TCP_CONN_REPAIR_SUPPORTED
+void WeaveTunnelConnectionMgr::SetConnectionRepairInfoCallback(nl::Weave::WeaveConnection::ConnectionRepairInfoGetterFunct aGetConnectionRepairInfo,
+                                                               void *repairCtxt)
+{
+    mServiceCon->GetConnectionRepairInfo = aGetConnectionRepairInfo;
+    mServiceCon->mRepairCtxt = repairCtxt;
+}
+#endif // WEAVE_CONFIG_TCP_CONN_REPAIR_SUPPORTED
 /**
  * Try to establish a connecttion to the Service either using
  * ServiceManager or directly
@@ -769,6 +781,10 @@ void WeaveTunnelConnectionMgr::HandleServiceConnectionComplete(WeaveConnection *
 
     SuccessOrExit(conErr);
 
+    // Set state variables to indicate successful connection.
+
+    tConnMgr->mConnectionState = kState_ConnectionEstablished;
+
     WeaveLogDetail(WeaveTunnel, "Connection established to node %" PRIx64 " (%s) on %s tunnel\n",
                    con->PeerNodeId, ipAddrStr, tConnMgr->mTunType == kType_TunnelPrimary?"primary":"backup");
 
@@ -803,52 +819,77 @@ void WeaveTunnelConnectionMgr::HandleServiceConnectionComplete(WeaveConnection *
         routePriority = WeaveTunnelRoute::kRoutePriority_Low;
     }
 
-    // Create tunnel route for Service and send Tunnel control message.
-
-    tunRoute = WeaveTunnelRoute();
-    globalId = WeaveFabricIdToIPv6GlobalId(tConnMgr->mTunAgent->mExchangeMgr->FabricState->FabricId);
-    if (tConnMgr->mTunAgent->mRole == kClientRole_BorderGateway)
+#if WEAVE_CONFIG_TCP_CONN_REPAIR_SUPPORTED
+    // If underlying TCP connection was repaired, then no need to send TunnelOpen
+    // but, instead, signal up that Tunnel is established.
+    if (tConnMgr->mServiceCon->IsRepaired)
     {
-        tunRoute.tunnelRoutePrefix[0].IPAddr = IPAddress::MakeULA(globalId, kWeaveSubnetId_ThreadMesh, 0);
-        tunRoute.tunnelRoutePrefix[0].Length = NL_INET_IPV6_DEFAULT_PREFIX_LEN;
-        tunRoute.tunnelRoutePrefix[1].IPAddr = IPAddress::MakeULA(globalId, kWeaveSubnetId_PrimaryWiFi, 0);
-        tunRoute.tunnelRoutePrefix[1].Length = NL_INET_IPV6_DEFAULT_PREFIX_LEN;
-        tunRoute.tunnelRoutePrefix[2].IPAddr = IPAddress::MakeULA(globalId, kWeaveSubnetId_PrimaryWiFi,
-                                                           WeaveNodeIdToIPv6InterfaceId(tConnMgr->mTunAgent->mExchangeMgr->FabricState->LocalNodeId));
-        tunRoute.tunnelRoutePrefix[2].Length = NL_INET_IPV6_MAX_PREFIX_LEN;
-        tunRoute.tunnelRoutePrefix[3].IPAddr = IPAddress::MakeULA(globalId, kWeaveSubnetId_ThreadMesh,
-                                                           WeaveNodeIdToIPv6InterfaceId(tConnMgr->mTunAgent->mExchangeMgr->FabricState->LocalNodeId));
-        tunRoute.tunnelRoutePrefix[3].Length = NL_INET_IPV6_MAX_PREFIX_LEN;
-        tunRoute.priority[0] = tunRoute.priority[1] = tunRoute.priority[2] = tunRoute.priority[3] = routePriority;
-        tunRoute.numOfPrefixes = 4;
+        tConnMgr->mConnectionState = kState_TunnelOpen;
+
+        tConnMgr->mTunFailedConnAttemptsInRow = 0;
+        tConnMgr->mTunReconnectFibonacciIndex = 0;
+        tConnMgr->mIsNetworkOnline = true;
+
+        // Stop the online check if it is running since tunnel is established.
+
+        tConnMgr->StopOnlineCheck();
+
+#if WEAVE_CONFIG_TUNNEL_LIVENESS_SUPPORTED
+        // Start the Tunnel Liveness timer
+
+        tConnMgr->StartLivenessTimer();
+#endif // WEAVE_CONFIG_TUNNEL_LIVENESS_SUPPORTED
+
+       // Call the TunnelOpen post processing function.
+
+       tConnMgr->mTunAgent->WeaveTunnelConnectionUp(NULL, tConnMgr, tConnMgr->mTunAgent->mRole != kClientRole_BorderGateway);
     }
-    else if (tConnMgr->mTunAgent->mRole == kClientRole_MobileDevice)
+    else
+#endif // WEAVE_CONFIG_TCP_CONN_REPAIR_SUPPORTED
     {
-        tunRoute.tunnelRoutePrefix[0].IPAddr = IPAddress::MakeULA(globalId, kWeaveSubnetId_MobileDevice,
-                                                           WeaveNodeIdToIPv6InterfaceId(tConnMgr->mTunAgent->mExchangeMgr->FabricState->LocalNodeId));
-        tunRoute.tunnelRoutePrefix[0].Length = NL_INET_IPV6_MAX_PREFIX_LEN;
-        tunRoute.priority[0] = routePriority;
-        tunRoute.numOfPrefixes = 1;
+        // Create tunnel route for Service and send Tunnel control message.
 
+        tunRoute = WeaveTunnelRoute();
+        globalId = WeaveFabricIdToIPv6GlobalId(tConnMgr->mTunAgent->mExchangeMgr->FabricState->FabricId);
+        if (tConnMgr->mTunAgent->mRole == kClientRole_BorderGateway)
+        {
+            tunRoute.tunnelRoutePrefix[0].IPAddr = IPAddress::MakeULA(globalId, kWeaveSubnetId_ThreadMesh, 0);
+            tunRoute.tunnelRoutePrefix[0].Length = NL_INET_IPV6_DEFAULT_PREFIX_LEN;
+            tunRoute.tunnelRoutePrefix[1].IPAddr = IPAddress::MakeULA(globalId, kWeaveSubnetId_PrimaryWiFi, 0);
+            tunRoute.tunnelRoutePrefix[1].Length = NL_INET_IPV6_DEFAULT_PREFIX_LEN;
+            tunRoute.tunnelRoutePrefix[2].IPAddr = IPAddress::MakeULA(globalId, kWeaveSubnetId_PrimaryWiFi,
+                                                               WeaveNodeIdToIPv6InterfaceId(tConnMgr->mTunAgent->mExchangeMgr->FabricState->LocalNodeId));
+            tunRoute.tunnelRoutePrefix[2].Length = NL_INET_IPV6_MAX_PREFIX_LEN;
+            tunRoute.tunnelRoutePrefix[3].IPAddr = IPAddress::MakeULA(globalId, kWeaveSubnetId_ThreadMesh,
+                                                               WeaveNodeIdToIPv6InterfaceId(tConnMgr->mTunAgent->mExchangeMgr->FabricState->LocalNodeId));
+            tunRoute.tunnelRoutePrefix[3].Length = NL_INET_IPV6_MAX_PREFIX_LEN;
+            tunRoute.priority[0] = tunRoute.priority[1] = tunRoute.priority[2] = tunRoute.priority[3] = routePriority;
+            tunRoute.numOfPrefixes = 4;
+        }
+        else if (tConnMgr->mTunAgent->mRole == kClientRole_MobileDevice)
+        {
+            tunRoute.tunnelRoutePrefix[0].IPAddr = IPAddress::MakeULA(globalId, kWeaveSubnetId_MobileDevice,
+                                                               WeaveNodeIdToIPv6InterfaceId(tConnMgr->mTunAgent->mExchangeMgr->FabricState->LocalNodeId));
+            tunRoute.tunnelRoutePrefix[0].Length = NL_INET_IPV6_MAX_PREFIX_LEN;
+            tunRoute.priority[0] = routePriority;
+            tunRoute.numOfPrefixes = 1;
+
+        }
+        else if (tConnMgr->mTunAgent->mRole == kClientRole_StandaloneDevice)
+        {
+            tunRoute.tunnelRoutePrefix[0].IPAddr = IPAddress::MakeULA(globalId, kWeaveSubnetId_PrimaryWiFi,
+                                                               WeaveNodeIdToIPv6InterfaceId(tConnMgr->mTunAgent->mExchangeMgr->FabricState->LocalNodeId));
+            tunRoute.tunnelRoutePrefix[0].Length = NL_INET_IPV6_MAX_PREFIX_LEN;
+            tunRoute.tunnelRoutePrefix[1].IPAddr = IPAddress::MakeULA(globalId, kWeaveSubnetId_ThreadMesh,
+                                                               WeaveNodeIdToIPv6InterfaceId(tConnMgr->mTunAgent->mExchangeMgr->FabricState->LocalNodeId));
+            tunRoute.tunnelRoutePrefix[1].Length = NL_INET_IPV6_MAX_PREFIX_LEN;
+            tunRoute.priority[0] = tunRoute.priority[1] = routePriority;
+            tunRoute.numOfPrefixes = 2;
+        }
+
+        conErr = tConnMgr->mTunControl.SendTunnelOpen(tConnMgr, &tunRoute);
+        SuccessOrExit(conErr);
     }
-    else if (tConnMgr->mTunAgent->mRole == kClientRole_StandaloneDevice)
-    {
-        tunRoute.tunnelRoutePrefix[0].IPAddr = IPAddress::MakeULA(globalId, kWeaveSubnetId_PrimaryWiFi,
-                                                           WeaveNodeIdToIPv6InterfaceId(tConnMgr->mTunAgent->mExchangeMgr->FabricState->LocalNodeId));
-        tunRoute.tunnelRoutePrefix[0].Length = NL_INET_IPV6_MAX_PREFIX_LEN;
-        tunRoute.tunnelRoutePrefix[1].IPAddr = IPAddress::MakeULA(globalId, kWeaveSubnetId_ThreadMesh,
-                                                           WeaveNodeIdToIPv6InterfaceId(tConnMgr->mTunAgent->mExchangeMgr->FabricState->LocalNodeId));
-        tunRoute.tunnelRoutePrefix[1].Length = NL_INET_IPV6_MAX_PREFIX_LEN;
-        tunRoute.priority[0] = tunRoute.priority[1] = routePriority;
-        tunRoute.numOfPrefixes = 2;
-    }
-
-    conErr = tConnMgr->mTunControl.SendTunnelOpen(tConnMgr, &tunRoute);
-    SuccessOrExit(conErr);
-
-    // Set state variables to indicate successful connection.
-
-    tConnMgr->mConnectionState = kState_ConnectionEstablished;
 
 #if WEAVE_CONFIG_TUNNEL_TCP_USER_TIMEOUT_SUPPORTED
     // With the connection established, configure the User timeout on the connection

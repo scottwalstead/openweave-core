@@ -208,8 +208,20 @@ WEAVE_ERROR WeaveConnection::Connect(uint64_t peerNodeId, WeaveAuthMode authMode
 
     WeaveLogProgress(MessageLayer, "Con start %04X %016llX %04X", LogId(), peerNodeId, authMode);
 
-    err = StartConnect();
-    SuccessOrExit(err);
+#if WEAVE_CONFIG_TCP_CONN_REPAIR_SUPPORTED
+    // Try and attempt to repair a pre-existing connection, if possible.
+    err = TryRepairConnection(PeerNodeId, PeerAddr, PeerPort, mTargetInterface);
+
+    if (err = WEAVE_NO_ERROR)
+    {
+        ExitNow();
+    }
+    else
+#endif // WEAVE_CONFIG_TCP_CONN_REPAIR_SUPPORTED
+    {
+        err = StartConnect();
+        SuccessOrExit(err);
+    }
 
 exit:
     return err;
@@ -404,14 +416,24 @@ WEAVE_ERROR WeaveConnection::Connect(uint64_t peerNodeId, WeaveAuthMode authMode
 
     WeaveLogProgress(MessageLayer, "Con start %04X %016llX %04X", LogId(), peerNodeId, authMode);
 
+#if WEAVE_CONFIG_TCP_CONN_REPAIR_SUPPORTED
+    // Try and repair connection here
+    err = TryRepairConnection(PeerNodeId, IPAddress::Any, PeerPort, mTargetInterface);
+    if (err == WEAVE_NO_ERROR)
+    {
+       ExitNow();
+    }
+    else
+#endif // WEAVE_CONFIG_TCP_CONN_REPAIR_SUPPORTED
+    {
 #if WEAVE_CONFIG_ENABLE_DNS_RESOLVER
-    // Initiate the host name resolution.
-    State = kState_Resolving;
-    err = MessageLayer->Inet->ResolveHostAddress(hostName, hostNameLen, dnsOptions, WEAVE_CONFIG_CONNECT_IP_ADDRS, mPeerAddrs, HandleResolveComplete, this);
+        // Initiate the host name resolution.
+        State = kState_Resolving;
+        err = MessageLayer->Inet->ResolveHostAddress(hostName, hostNameLen, dnsOptions, WEAVE_CONFIG_CONNECT_IP_ADDRS, mPeerAddrs, HandleResolveComplete, this);
 #else // !WEAVE_CONFIG_ENABLE_DNS_RESOLVER
-    err = StartConnectToAddressLiteral(hostName, hostNameLen);
+        err = StartConnectToAddressLiteral(hostName, hostNameLen);
 #endif // !WEAVE_CONFIG_ENABLE_DNS_RESOLVER
-
+    }
 exit:
     return err;
 }
@@ -508,8 +530,18 @@ WEAVE_ERROR WeaveConnection::Connect(uint64_t peerNodeId, WeaveAuthMode authMode
 
     WeaveLogProgress(MessageLayer, "Con start %04X %016llX %04X", LogId(), peerNodeId, authMode);
 
-    err = TryNextPeerAddress(WEAVE_ERROR_HOST_PORT_LIST_EMPTY);
-    SuccessOrExit(err);
+#if WEAVE_CONFIG_TCP_CONN_REPAIR_SUPPORTED
+    err = TryRepairConnection(PeerNodeId, IPAddress::Any, WEAVE_PORT, intf);
+    if (err == WEAVE_NO_ERROR)
+    {
+       ExitNow();
+    }
+    else
+#endif // WEAVE_CONFIG_TCP_CONN_REPAIR_SUPPORTED
+    {
+        err = TryNextPeerAddress(WEAVE_ERROR_HOST_PORT_LIST_EMPTY);
+        SuccessOrExit(err);
+    }
 
 exit:
     return err;
@@ -1243,6 +1275,59 @@ void WeaveConnection::StartSession()
     }
 }
 
+#if WEAVE_CONFIG_TCP_CONN_REPAIR_SUPPORTED
+WEAVE_ERROR WeaveConnection::TryRepairConnection(uint64_t peerNodeId, IPAddress destAddr, uint16_t destPort, InterfaceId intf)
+{
+    WEAVE_ERROR err = WEAVE_NO_ERROR;
+    TCPConnRepairInfo repairInfo;
+
+    // Get Repair Info using PeerNodeId, Dst Port
+    VerifyOrExit(GetConnectionRepairInfo != NULL, err = WEAVE_ERROR_CONNECTION_REPAIR_FAILED);
+
+    err = GetConnectionRepairInfo(peerNodeId, destAddr, destPort, &repairInfo, mRepairCtxt);
+    SuccessOrExit(err);
+
+    // Allocate a new TCP end point.
+    err = MessageLayer->Inet->NewTCPEndPoint(&mTcpEndPoint);
+    SuccessOrExit(err);
+
+    mTcpEndPoint->AppState = this;
+    mTcpEndPoint->OnConnectComplete = HandleConnectComplete;
+
+    State = kState_Connecting;
+
+    // Call into TCPEndPoint to repair the TCP connection with the fetched
+    // repair info.
+    err = mTcpEndPoint->RepairConnection(repairInfo, intf);
+    SuccessOrExit(err);
+
+    // Set the connection variables
+    // TODO:
+    PeerAddr = repairInfo.dstIP;
+    PeerNodeId = peerNodeId;
+    PeerPort = repairInfo.dstPort;
+    IsRepaired = true;
+
+    // After repairing connection, call OnConnectComplete callback.
+    // TODO: Fire a timer to invoke this callback 
+    mTcpEndPoint->OnConnectComplete(mTcpEndPoint, INET_NO_ERROR);
+
+exit:
+
+    if (err != WEAVE_NO_ERROR)
+    {
+        if (mTcpEndPoint != NULL)
+        {
+            mTcpEndPoint->Abort();
+            mTcpEndPoint->Free();
+            mTcpEndPoint = NULL;
+        }
+    }
+
+    return err;
+}
+#endif // WEAVE_CONFIG_TCP_CONN_REPAIR_SUPPORTED
+
 WEAVE_ERROR WeaveConnection::StartConnect()
 {
     WEAVE_ERROR err;
@@ -1675,6 +1760,11 @@ void WeaveConnection::Init(WeaveMessageLayer *msgLayer)
 #if WEAVE_CONFIG_ENABLE_DNS_RESOLVER
     mDNSOptions = 0;
 #endif
+#if WEAVE_CONFIG_TCP_CONN_REPAIR_SUPPORTED
+    GetConnectionRepairInfo = NULL;
+    IsRepaired = false;
+    mRepairCtxt = NULL;
+#endif // WEAVE_CONFIG_TCP_CONN_REPAIR_SUPPORTED
     mFlags = 0;
 }
 
